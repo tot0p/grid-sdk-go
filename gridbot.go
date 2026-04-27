@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -69,6 +70,43 @@ func (c *Client) connect() error {
 	return nil
 }
 
+// handshake sends the client hello and waits for the server ack.
+// Returns (fatal, err) — fatal=true means the caller must not reconnect.
+func (c *Client) handshake() (fatal bool, err error) {
+	hello, _ := json.Marshal(map[string]string{"type": "hello", "version": SDKVersion})
+	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := c.conn.WriteMessage(websocket.TextMessage, hello); err != nil {
+		return false, fmt.Errorf("handshake send: %w", err)
+	}
+
+	c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, raw, err := c.conn.ReadMessage()
+	c.conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return false, fmt.Errorf("handshake read: %w", err)
+	}
+
+	var resp struct {
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return false, fmt.Errorf("handshake: invalid server response")
+	}
+	if resp.Type == "error" {
+		return resp.Code == "version_mismatch", fmt.Errorf("handshake rejected: %s", resp.Message)
+	}
+	if resp.Type != "hello" {
+		return false, fmt.Errorf("handshake: unexpected message type %q", resp.Type)
+	}
+
+	serverMajorMinor := strings.Join(strings.SplitN(resp.Version, ".", 3)[:2], ".")
+	c.logf("Connected (server v%s, SDK v%s)", serverMajorMinor, SDKVersion)
+	return false, nil
+}
+
 func (c *Client) close() {
 	if c.conn != nil {
 		c.conn.Close()
@@ -78,6 +116,7 @@ func (c *Client) close() {
 
 // Run connects to the server and starts the game loop.
 // It automatically reconnects with exponential backoff on disconnection.
+// Returns a non-nil error only on fatal errors (e.g. version mismatch).
 // Blocks until Stop() is called.
 func (c *Client) Run() error {
 	backoff := 5 * time.Second
@@ -101,9 +140,22 @@ func (c *Client) Run() error {
 			continue
 		}
 
-		backoff = 5 * time.Second
-		c.logf("Connected to game server")
+		if fatal, err := c.handshake(); err != nil {
+			c.logf("Handshake failed: %v", err)
+			c.close()
+			if fatal {
+				return fmt.Errorf("fatal: %w", err)
+			}
+			select {
+			case <-time.After(backoff):
+			case <-c.stopCh:
+				return nil
+			}
+			backoff = min(backoff*2, maxBackoff)
+			continue
+		}
 
+		backoff = 5 * time.Second
 		c.readLoop()
 
 		c.close()
@@ -187,10 +239,8 @@ func (c *Client) handleMessage(message []byte) {
 		return
 	}
 
-	// Call user strategy
 	direction := c.config.Strategy.Move(&state)
 
-	// Send command
 	data, _ := json.Marshal(command{Action: "move", Direction: string(direction)})
 	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
