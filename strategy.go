@@ -24,4 +24,6 @@ type MatchAware interface {
 	OnMatchStart(state *GameState)
 	// OnDeath is called when the bot dies (You.Alive becomes false).
 	OnDeath(state *GameState)
+	// OnWin is called when the bot wins (all opponents are dead, bot still alive).
+	OnWin(state *GameState)
 }

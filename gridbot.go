@@ -239,6 +239,24 @@ func (c *Client) handleMessage(message []byte) {
 		return
 	}
 
+	// Detect win: bot alive and all opponents dead
+	if c.inMatch && len(state.Bots) > 1 {
+		won := true
+		for _, bot := range state.Bots {
+			if bot.BotID != state.You.BotID && bot.Alive {
+				won = false
+				break
+			}
+		}
+		if won {
+			if ma, ok := c.config.Strategy.(MatchAware); ok {
+				ma.OnWin(&state)
+			}
+			c.inMatch = false
+			return
+		}
+	}
+
 	direction := c.config.Strategy.Move(&state)
 
 	data, _ := json.Marshal(command{Action: "move", Direction: string(direction)})
