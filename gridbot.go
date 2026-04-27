@@ -13,7 +13,7 @@ import (
 
 // Config configures the bot client.
 type Config struct {
-	// ServerURL is the WebSocket server URL (e.g., "ws://localhost:8083").
+	// ServerURL is the WebSocket server URL (e.g. "wss://game.learn2code.tech").
 	ServerURL string
 
 	// Token is the bot authentication token.
@@ -29,12 +29,13 @@ type Config struct {
 
 // Client manages the WebSocket connection to the game server.
 type Client struct {
-	config        Config
-	conn          *websocket.Conn
-	lastDirection Direction
-	inMatch       bool
-	lastTurn      int
-	stopCh        chan struct{}
+	config         Config
+	conn           *websocket.Conn
+	lastDirection  Direction
+	inMatch        bool
+	matchStartTurn int
+	lastState      *GameState // most recent game state received
+	stopCh         chan struct{}
 }
 
 // NewClient creates a new bot client with the given configuration.
@@ -115,7 +116,7 @@ func (c *Client) close() {
 }
 
 // Run connects to the server and starts the game loop.
-// It automatically reconnects with exponential backoff on disconnection.
+// Automatically reconnects with exponential backoff (5s to 60s).
 // Returns a non-nil error only on fatal errors (e.g. version mismatch).
 // Blocks until Stop() is called.
 func (c *Client) Run() error {
@@ -206,64 +207,131 @@ func (c *Client) readLoop() {
 	}
 }
 
+// envelope peeks at just the "type" field of an incoming message.
+type envelope struct {
+	Type string `json:"type"`
+}
+
+// serverMatchStart is the match_start message sent by the server.
+type serverMatchStart struct {
+	Type        string      `json:"type"`
+	MatchID     uint32      `json:"match_id"`
+	FieldWidth  int         `json:"field_width"`
+	FieldHeight int         `json:"field_height"`
+	Bots        []*BotState `json:"bots"`
+}
+
+// BotState mirrors the server's BotState struct.
+type BotState struct {
+	BotID     uint32 `json:"bot_id"`
+	BotName   string `json:"bot_name"`
+	X         int    `json:"x"`
+	Y         int    `json:"y"`
+	Direction string `json:"direction"`
+	Alive     bool   `json:"alive"`
+	Score     int    `json:"score"`
+	Color     string `json:"color"`
+}
+
+// serverMatchEnd is the personalised match_end message sent by the server.
+type serverMatchEnd struct {
+	Type     string `json:"type"`
+	MatchID  uint32 `json:"match_id"`
+	Won      bool   `json:"won"`
+	Reason   string `json:"reason"`
+	Score    int    `json:"score"`
+	Position int    `json:"position"`
+	Turns    int    `json:"turns"`
+	WinnerID *uint32 `json:"winner_id"`
+}
+
 func (c *Client) handleMessage(message []byte) {
-	var state GameState
-	if err := json.Unmarshal(message, &state); err != nil {
+	var env envelope
+	if err := json.Unmarshal(message, &env); err != nil {
 		return
 	}
 
-	if state.Type != "game_state" {
-		return
-	}
+	switch env.Type {
 
-	if state.You == nil {
-		return
-	}
-
-	// Detect new match
-	if state.Turn <= 1 && (state.Turn < c.lastTurn || !c.inMatch) {
-		c.logf("New match started!")
-		c.lastDirection = Direction(state.You.Direction)
-		c.inMatch = true
-		if ma, ok := c.config.Strategy.(MatchAware); ok {
-			ma.OnMatchStart(&state)
-		}
-	}
-	c.lastTurn = state.Turn
-
-	if !state.You.Alive {
-		if ma, ok := c.config.Strategy.(MatchAware); ok {
-			ma.OnDeath(&state)
-		}
-		c.inMatch = false
-		return
-	}
-
-	// Detect win: bot alive and all opponents dead
-	if c.inMatch && len(state.Bots) > 1 {
-		won := true
-		for _, bot := range state.Bots {
-			if bot.BotID != state.You.BotID && bot.Alive {
-				won = false
-				break
-			}
-		}
-		if won {
-			if ma, ok := c.config.Strategy.(MatchAware); ok {
-				ma.OnWin(&state)
-			}
-			c.inMatch = false
+	case "match_start":
+		var msg serverMatchStart
+		if err := json.Unmarshal(message, &msg); err != nil {
 			return
 		}
-	}
+		c.logf("Match %d starting (%dx%d, %d bots)", msg.MatchID, msg.FieldWidth, msg.FieldHeight, len(msg.Bots))
+		c.inMatch = true
+		c.matchStartTurn = 0
+		c.lastState = nil
 
-	direction := c.config.Strategy.Move(&state)
+	case "match_end":
+		var msg serverMatchEnd
+		if err := json.Unmarshal(message, &msg); err != nil {
+			return
+		}
+		result := MatchResult{
+			Won:   msg.Won,
+			Score: msg.Score,
+			Turns: msg.Turns,
+			State: c.lastState,
+		}
+		if msg.Won {
+			c.logf("Match %d WON — score %d in %d turns", msg.MatchID, msg.Score, msg.Turns)
+			if wh, ok := c.config.Strategy.(WinHandler); ok {
+				wh.OnWin(c.lastState)
+			}
+		} else {
+			c.logf("Match %d LOST — score %d in %d turns (reason: %s)", msg.MatchID, msg.Score, msg.Turns, msg.Reason)
+			if dh, ok := c.config.Strategy.(DeathHandler); ok {
+				dh.OnDeath(c.lastState)
+			}
+		}
+		if me, ok := c.config.Strategy.(MatchEnder); ok {
+			me.OnMatchEnd(result)
+		}
+		c.inMatch = false
 
-	data, _ := json.Marshal(command{Action: "move", Direction: string(direction)})
-	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		c.logf("Failed to send command: %v", err)
-		return
+	case "game_state":
+		var state GameState
+		if err := json.Unmarshal(message, &state); err != nil {
+			return
+		}
+		if state.You == nil {
+			return
+		}
+		c.lastState = &state
+
+		// Detect match start: fires if server match_start was missed OR as
+		// a safety net for older servers.
+		if !c.inMatch || (state.Turn <= 1 && state.Turn < c.matchStartTurn) {
+			c.logf("New match started!")
+			c.lastDirection = Direction(state.You.Direction)
+			c.inMatch = true
+			c.matchStartTurn = state.Turn
+			if ms, ok := c.config.Strategy.(MatchStarter); ok {
+				ms.OnMatchStart(&state)
+			}
+		} else if c.inMatch && c.matchStartTurn == 0 {
+			// First game_state after a match_start message
+			c.matchStartTurn = state.Turn
+			c.lastDirection = Direction(state.You.Direction)
+			if ms, ok := c.config.Strategy.(MatchStarter); ok {
+				ms.OnMatchStart(&state)
+			}
+		}
+
+		// If the bot is dead, wait for the match_end message
+		if !state.You.Alive {
+			return
+		}
+
+		direction := c.config.Strategy.Move(&state)
+
+		data, _ := json.Marshal(command{Action: "move", Direction: string(direction)})
+		c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			c.logf("Failed to send command: %v", err)
+			return
+		}
+		c.lastDirection = direction
 	}
-	c.lastDirection = direction
 }

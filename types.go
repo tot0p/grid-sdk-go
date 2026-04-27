@@ -12,7 +12,7 @@ type Bot struct {
 	Color     string `json:"color"`
 }
 
-// GameState represents the state sent by the server each turn.
+// GameState represents the full game state sent by the server each turn.
 type GameState struct {
 	Type   string  `json:"type"`
 	Turn   int     `json:"turn"`
@@ -23,17 +23,17 @@ type GameState struct {
 	Grid   [][]int `json:"grid"`
 }
 
-// Position represents a coordinate on the grid.
+// Position is a coordinate on the grid.
 type Position struct {
 	X int
 	Y int
 }
 
-// Move represents a candidate move with pre-computed metadata.
+// Move is a candidate move with pre-computed metadata.
 type Move struct {
 	Direction  Direction
-	X, Y       int  // Target position after moving
-	HeadOnRisk bool // True if an opponent could also move here next turn
+	X, Y       int  // target position after moving
+	HeadOnRisk bool // true if an opponent could also move here next turn
 }
 
 // command is the move command sent to the server (unexported).
