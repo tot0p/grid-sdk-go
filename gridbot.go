@@ -29,13 +29,14 @@ type Config struct {
 
 // Client manages the WebSocket connection to the game server.
 type Client struct {
-	config         Config
-	conn           *websocket.Conn
-	lastDirection  Direction
-	inMatch        bool
-	matchStartTurn int
-	lastState      *GameState // most recent game state received
-	stopCh         chan struct{}
+	config              Config
+	conn                *websocket.Conn
+	lastDirection       Direction
+	inMatch             bool
+	matchStartTurn      int
+	onMatchStartFired   bool
+	lastState           *GameState // most recent game state received
+	stopCh              chan struct{}
 }
 
 // NewClient creates a new bot client with the given configuration.
@@ -261,6 +262,7 @@ func (c *Client) handleMessage(message []byte) {
 		c.logf("Match %d starting (%dx%d, %d bots)", msg.MatchID, msg.FieldWidth, msg.FieldHeight, len(msg.Bots))
 		c.inMatch = true
 		c.matchStartTurn = 0
+		c.onMatchStartFired = false
 		c.lastState = nil
 
 	case "match_end":
@@ -289,6 +291,7 @@ func (c *Client) handleMessage(message []byte) {
 			me.OnMatchEnd(result)
 		}
 		c.inMatch = false
+		c.onMatchStartFired = false
 
 	case "game_state":
 		var state GameState
@@ -307,15 +310,21 @@ func (c *Client) handleMessage(message []byte) {
 			c.lastDirection = Direction(state.You.Direction)
 			c.inMatch = true
 			c.matchStartTurn = state.Turn
-			if ms, ok := c.config.Strategy.(MatchStarter); ok {
-				ms.OnMatchStart(&state)
+			if !c.onMatchStartFired {
+				c.onMatchStartFired = true
+				if ms, ok := c.config.Strategy.(MatchStarter); ok {
+					ms.OnMatchStart(&state)
+				}
 			}
 		} else if c.inMatch && c.matchStartTurn == 0 {
 			// First game_state after a match_start message
 			c.matchStartTurn = state.Turn
 			c.lastDirection = Direction(state.You.Direction)
-			if ms, ok := c.config.Strategy.(MatchStarter); ok {
-				ms.OnMatchStart(&state)
+			if !c.onMatchStartFired {
+				c.onMatchStartFired = true
+				if ms, ok := c.config.Strategy.(MatchStarter); ok {
+					ms.OnMatchStart(&state)
+				}
 			}
 		}
 
