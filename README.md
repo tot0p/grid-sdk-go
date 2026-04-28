@@ -71,14 +71,21 @@ gridbot.StrategyFunc(func(state *gridbot.GameState) gridbot.Direction {
 })
 ```
 
-Optionally implement `MatchAware` for match lifecycle callbacks:
+Optionally implement lifecycle interfaces for match callbacks:
 
 ```go
+type MatchStarter interface { OnMatchStart(state *GameState) }
+type DeathHandler  interface { OnDeath(state *GameState) }
+type WinHandler    interface { OnWin(state *GameState) }
+type MatchEnder    interface { OnMatchEnd(result MatchResult) }
+
+// MatchAware combines all four. Embed BaseMatchAware for no-op defaults.
 type MatchAware interface {
-	OnMatchStart(state *GameState)
-	OnDeath(state *GameState)
+	MatchStarter; DeathHandler; WinHandler; MatchEnder
 }
 ```
+
+`OnMatchStart` is guaranteed to fire exactly once per match — safe to use for per-match state initialization.
 
 ## Helper Functions
 
@@ -112,3 +119,7 @@ See the [examples/simple](examples/simple) directory for a full bot that picks t
 ```bash
 go run ./examples/simple -token YOUR_TOKEN -server ws://localhost:8083
 ```
+
+## Other SDKs
+
+- **Python**: [`grid-sdk-py`](https://github.com/tot0p/grid-sdk-py) — `pip install grid-sdk-py==0.3.4`
